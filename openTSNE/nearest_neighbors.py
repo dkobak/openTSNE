@@ -381,13 +381,13 @@ class NNDescent(KNNIndex):
         n_jobs_pynndescent = self.n_jobs
         import scipy.sparse as sp
 
-        if sp.issparse(data) and self.n_jobs != 1:
-            warnings.warn(
-                f"Running `pynndescent` with n_jobs=1 because it does not "
-                f"currently support n_jobs>1 with sparse inputs. See "
-                f"https://github.com/lmcinnes/pynndescent/issues/94."
-            )
-            n_jobs_pynndescent = 1
+#        if sp.issparse(data) and self.n_jobs != 1:
+#            warnings.warn(
+#                f"Running `pynndescent` with n_jobs=1 because it does not "
+#                f"currently support n_jobs>1 with sparse inputs. See "
+#                f"https://github.com/lmcinnes/pynndescent/issues/94."
+#            )
+#            n_jobs_pynndescent = 1
 
         # UMAP uses the "alternative" algorithm, but that sometimes causes
         # memory corruption, so use the standard one, which seems to work fine
@@ -399,9 +399,9 @@ class NNDescent(KNNIndex):
             random_state=self.random_state,
             n_trees=n_trees,
             n_iters=n_iters,
-            algorithm="standard",
             max_candidates=60,
-            n_jobs=n_jobs_pynndescent,
+            n_jobs=self.n_jobs,
+            verbose=self.verbose,
         )
 
         # -1 in indices means that pynndescent failed

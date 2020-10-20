@@ -1124,6 +1124,7 @@ class TSNE(BaseEstimator):
         callbacks_every_iters=50,
         random_state=None,
         verbose=False,
+        constrain=None,
     ):
         self.n_components = n_components
         self.perplexity = perplexity
@@ -1165,6 +1166,8 @@ class TSNE(BaseEstimator):
 
         self.random_state = random_state
         self.verbose = verbose
+        
+        self.constrain = constrain
 
     def fit(self, X):
         """Fit a t-SNE embedding for a given data set.
@@ -1308,6 +1311,7 @@ class TSNE(BaseEstimator):
             # Callback params
             "callbacks": self.callbacks,
             "callbacks_every_iters": self.callbacks_every_iters,
+            "constrain": self.constrain,
         }
 
         return TSNEEmbedding(
@@ -1481,6 +1485,7 @@ class gradient_descent:
         callbacks=None,
         callbacks_every_iters=50,
         verbose=False,
+        constrain=None,
     ):
         """Perform batch gradient descent with momentum and gains.
 
@@ -1704,11 +1709,16 @@ class gradient_descent:
                 update[mask] *= max_step_norm
 
             embedding += update
-
+            
             # Zero-mean the embedding only if we're not adding new data points,
             # otherwise this will reset point positions
             if reference_embedding is None:
                 embedding -= np.mean(embedding, axis=0)
+                
+            # Constrain the points within the provided shape
+            if constrain:
+                embedding, mask = constrain(embedding)
+                self.gains[mask] = 0
 
             # Limit any new points within the circle defined by the interpolation grid
             if should_limit_range:
