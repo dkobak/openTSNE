@@ -993,6 +993,7 @@ class Uniform(Affinities):
         n_jobs=1,
         random_state=None,
         verbose=False,
+        k_random_out_of=None,
     ):
         self.n_samples = data.shape[0]
         self.k_neighbors = k_neighbors
@@ -1005,9 +1006,18 @@ class Uniform(Affinities):
                 (k_neighbors, self.n_samples)
             )
 
-        self.knn_index, neighbors, distances = build_knn_index(
-            data, method, k_neighbors, metric, metric_params, n_jobs, random_state, verbose
-        )
+        if k_random_out_of is not None:
+            self.knn_index, neighbors, distances = build_knn_index(
+                data, method, k_random_out_of, metric, metric_params, n_jobs, random_state, verbose
+            )
+            ind = np.random.rand(neighbors.shape[0],neighbors.shape[1]).argsort(1)[:,:k_neighbors]
+            neighbors = np.array([neighbors[i][ind[i]] for i in range(neighbors.shape[0])])
+            distances = np.array([distances[i][ind[i]] for i in range(distances.shape[0])])
+        else:
+            self.knn_index, neighbors, distances = build_knn_index(
+                data, method, k_neighbors, metric, metric_params, n_jobs, random_state, verbose
+            )
+
         P = sp.csr_matrix(
             (
                 np.ones_like(distances).ravel(),
