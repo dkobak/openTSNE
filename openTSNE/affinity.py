@@ -1,6 +1,6 @@
 import logging
+import numbers
 import operator
-from typing import Iterable
 from functools import reduce
 
 import numpy as np
@@ -9,6 +9,7 @@ import scipy.sparse as sp
 from openTSNE import _tsne
 from openTSNE import nearest_neighbors
 from openTSNE import utils
+from openTSNE.utils import is_package_installed
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class Affinities:
     def __init__(self, verbose=False):
         self.P = None
         self.verbose = verbose
+        self.knn_index: nearest_neighbors.KNNIndex = None
 
     def to_new(self, data, return_distances=False):
         """Compute the affinities of new samples to the initial samples.
@@ -69,6 +71,12 @@ class Affinities:
 
         """
 
+    @property
+    def n_samples(self):
+        if self.knn_index is None:
+            raise RuntimeError("`knn_index` is not set!")
+        return self.knn_index.n_samples
+
 
 class PerplexityBasedNN(Affinities):
     """Compute affinities using nearest neighbors.
@@ -86,7 +94,7 @@ class PerplexityBasedNN(Affinities):
 
     method: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
+        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
         if the input data matrix is not a sparse object and if Annoy supports
         the given metric. Otherwise it uses Pynndescent. ``auto`` uses exact
         nearest neighbors for N<1000 and the same heuristic as ``approx`` for N>=1000.
@@ -115,11 +123,20 @@ class PerplexityBasedNN(Affinities):
 
     verbose: bool
 
+    k_neighbors: int or ``auto``
+        The number of neighbors to use in the kNN graph. If ``auto`` (default),
+        it is set to three times the perplexity.
+
+    knn_index: Optional[nearest_neighbors.KNNIndex]
+        Optionally, a precomptued ``openTSNE.nearest_neighbors.KNNIndex`` object
+        can be specified. This option will ignore any KNN-related parameters.
+        When ``knn_index`` is specified, ``data`` must be set to None.
+
     """
 
     def __init__(
         self,
-        data,
+        data=None,
         perplexity=30,
         method="auto",
         metric="euclidean",
@@ -128,36 +145,73 @@ class PerplexityBasedNN(Affinities):
         n_jobs=1,
         random_state=None,
         verbose=False,
+        k_neighbors="auto",
+        knn_index=None,
     ):
-        self.n_samples = data.shape[0]
-        self.perplexity = self.check_perplexity(perplexity)
-        self.verbose = verbose
+        # This can't work if neither data nor the knn index are specified
+        if data is None and knn_index is None:
+            raise ValueError(
+                "At least one of the parameters `data` or `knn_index` must be specified!"
+            )
+        # This can't work if both data and the knn index are specified
+        if data is not None and knn_index is not None:
+            raise ValueError(
+                "Both `data` or `knn_index` were specified! Please pass only one."
+            )
 
-        k_neighbors = min(self.n_samples - 1, int(3 * self.perplexity))
-        self.knn_index, self.__neighbors, self.__distances = build_knn_index(
-            data, method, k_neighbors, metric, metric_params, n_jobs, random_state, verbose
-        )
+        # Find the nearest neighbors
+        if knn_index is None:
+            n_samples = data.shape[0]
 
-        with utils.Timer("Calculating affinity matrix...", self.verbose):
+            if k_neighbors == "auto":
+                _k_neighbors = min(n_samples - 1, int(3 * perplexity))
+            else:
+                _k_neighbors = k_neighbors
+
+            effective_perplexity = self.check_perplexity(perplexity, _k_neighbors)
+            if _k_neighbors > int(3 * effective_perplexity):
+                log.warning(
+                    "The k_neighbors value is over 3 times larger than the perplexity value. "
+                    "This may result in an unnecessary slowdown."
+                )
+
+            self.knn_index = get_knn_index(
+                data, method, _k_neighbors, metric, metric_params, n_jobs,
+                random_state, verbose
+            )
+
+        else:
+            self.knn_index = knn_index
+            effective_perplexity = self.check_perplexity(perplexity, self.knn_index.k)
+            log.info("KNN index provided. Ignoring KNN-related parameters.")
+
+        self.__neighbors, self.__distances = self.knn_index.build()
+
+        with utils.Timer("Calculating affinity matrix...", verbose):
             self.P = joint_probabilities_nn(
                 self.__neighbors,
                 self.__distances,
-                [self.perplexity],
+                [effective_perplexity],
                 symmetrize=symmetrize,
                 n_jobs=n_jobs,
             )
 
+        self.perplexity = perplexity
+        self.effective_perplexity_ = effective_perplexity
+        self.symmetrize = symmetrize
         self.n_jobs = n_jobs
+        self.verbose = verbose
 
     def set_perplexity(self, new_perplexity):
         """Change the perplexity of the affinity matrix.
 
-        Note that we only allow lowering the perplexity or restoring it to its
-        original value. This restriction exists because setting a higher
-        perplexity value requires recomputing all the nearest neighbors, which
-        can take a long time. To avoid potential confusion as to why execution
-        time is slow, this is not allowed. If you would like to increase the
-        perplexity above the initial value, simply create a new instance.
+        Note that we only allow setting the perplexity to a value not larger
+        than the number of neighbors used for the original perplexity. This
+        restriction exists because setting a higher perplexity value requires
+        recomputing all the nearest neighbors, which can take a long time.
+        To avoid potential confusion as to why execution time is slow, this
+        is not allowed. If you would like to increase the perplexity above
+        that value, simply create a new instance.
 
         Parameters
         ----------
@@ -168,20 +222,30 @@ class PerplexityBasedNN(Affinities):
         # If the value hasn't changed, there's nothing to do
         if new_perplexity == self.perplexity:
             return
-        # Verify that the perplexity isn't too large
-        new_perplexity = self.check_perplexity(new_perplexity)
-        # Recompute the affinity matrix
-        k_neighbors = min(self.n_samples - 1, int(3 * new_perplexity))
-        if k_neighbors > self.__neighbors.shape[1]:
+        # Verify that the perplexity isn't negative
+        effective_perplexity = self.check_perplexity(new_perplexity, np.inf)
+        # Verify that the perplexity isn't too large for the kNN graph
+        if effective_perplexity > self.__neighbors.shape[1]:
             raise RuntimeError(
-                "The desired perplexity `%.2f` is larger than the initial one "
-                "used. This would need to recompute the nearest neighbors, "
+                "The desired perplexity `%.2f` is larger than the kNN graph "
+                "allows. This would need to recompute the nearest neighbors, "
                 "which is not efficient. Please create a new `%s` instance "
                 "with the increased perplexity."
-                % (new_perplexity, self.__class__.__name__)
+                % (effective_perplexity, self.__class__.__name__)
+            )
+        # Warn if the perplexity is larger than the heuristic
+        if 3 * effective_perplexity > self.__neighbors.shape[1]:
+            log.warning(
+                "The new perplexity is quite close to the computed number of "
+                "nearest neighbors. The results may be unexpected. Consider "
+                "creating a new `%s` instance with the increased perplexity."
+                % self.__class__.__name__
             )
 
+        # Recompute the affinity matrix
         self.perplexity = new_perplexity
+        self.effective_perplexity_ = effective_perplexity
+        k_neighbors = int(3 * new_perplexity)
 
         with utils.Timer(
             "Perplexity changed. Recomputing affinity matrix...", self.verbose
@@ -189,12 +253,14 @@ class PerplexityBasedNN(Affinities):
             self.P = joint_probabilities_nn(
                 self.__neighbors[:, :k_neighbors],
                 self.__distances[:, :k_neighbors],
-                [self.perplexity],
-                symmetrize=True,
+                [self.effective_perplexity_],
+                symmetrize=self.symmetrize,
                 n_jobs=self.n_jobs,
             )
 
-    def to_new(self, data, perplexity=None, return_distances=False):
+    def to_new(
+        self, data, perplexity=None, return_distances=False, k_neighbors="auto"
+    ):
         """Compute the affinities of new samples to the initial samples.
 
         This is necessary for embedding new data points into an existing
@@ -216,6 +282,10 @@ class PerplexityBasedNN(Affinities):
             If needed, the function can return the indices of the nearest
             neighbors and their corresponding distances.
 
+        k_neighbors: int or ``auto``
+            The number of neighbors to query kNN graph for. If ``auto``
+            (default), it is set to three times the perplexity.
+
         Returns
         -------
         P: array_like
@@ -234,17 +304,23 @@ class PerplexityBasedNN(Affinities):
             data point.
 
         """
-        perplexity = perplexity if perplexity is not None else self.perplexity
-        perplexity = self.check_perplexity(perplexity)
-        k_neighbors = min(self.n_samples - 1, int(3 * perplexity))
 
-        neighbors, distances = self.knn_index.query(data, k_neighbors)
+        perplexity = perplexity if perplexity is not None else self.perplexity
+
+        if k_neighbors == "auto":
+            _k_neighbors = min(self.n_samples, int(3 * perplexity))
+        else:
+            _k_neighbors = k_neighbors
+
+        effective_perplexity = self.check_perplexity(perplexity, _k_neighbors)
+
+        neighbors, distances = self.knn_index.query(data, _k_neighbors)
 
         with utils.Timer("Calculating affinity matrix...", self.verbose):
             P = joint_probabilities_nn(
                 neighbors,
                 distances,
-                [perplexity],
+                [effective_perplexity],
                 symmetrize=False,
                 normalization="point-wise",
                 n_reference_samples=self.n_samples,
@@ -256,12 +332,13 @@ class PerplexityBasedNN(Affinities):
 
         return P
 
-    def check_perplexity(self, perplexity):
+    @staticmethod
+    def check_perplexity(perplexity, k_neighbors):
         if perplexity <= 0:
             raise ValueError("Perplexity must be >=0. %.2f given" % perplexity)
 
-        if self.n_samples - 1 < 3 * perplexity:
-            old_perplexity, perplexity = perplexity, (self.n_samples - 1) / 3
+        if perplexity > k_neighbors:
+            old_perplexity, perplexity = perplexity, k_neighbors / 3
             log.warning(
                 "Perplexity value %d is too high. Using perplexity %.2f instead"
                 % (old_perplexity, perplexity)
@@ -270,10 +347,16 @@ class PerplexityBasedNN(Affinities):
         return perplexity
 
 
-def build_knn_index(
+def get_knn_index(
     data, method, k, metric, metric_params=None, n_jobs=1, random_state=None, verbose=False
 ):
-    if not sp.issparse(data) and metric in [
+    # If we're dealing with a precomputed distance matrix, our job is very easy
+    # so we can skip all the remaining checks
+    if metric == "precomputed":
+        return nearest_neighbors.PrecomputedDistanceMatrix(data, k=k)
+
+    preferred_approx_method = nearest_neighbors.Annoy
+    if is_package_installed("pynndescent") and (sp.issparse(data) or metric not in [
         "cosine",
         "euclidean",
         "manhattan",
@@ -282,22 +365,21 @@ def build_knn_index(
         "l1",
         "l2",
         "taxicab",
-    ]:
-        preferred_approx_method = nearest_neighbors.Annoy
-    else:
+    ]):
         preferred_approx_method = nearest_neighbors.NNDescent
 
     if data.shape[0] < 1000:
-        preferred_method = nearest_neighbors.BallTree
+        preferred_method = nearest_neighbors.Sklearn
     else:
         preferred_method = preferred_approx_method
 
     methods = {
-        "exact": nearest_neighbors.BallTree,
+        "exact": nearest_neighbors.Sklearn,
         "auto": preferred_method,
         "approx": preferred_approx_method,
         "annoy": nearest_neighbors.Annoy,
         "pynndescent": nearest_neighbors.NNDescent,
+        "hnsw": nearest_neighbors.HNSW
     }
     if isinstance(method, nearest_neighbors.KNNIndex):
         knn_index = method
@@ -309,6 +391,8 @@ def build_knn_index(
         )
     else:
         knn_index = methods[method](
+            data=data,
+            k=k,
             metric=metric,
             metric_params=metric_params,
             n_jobs=n_jobs,
@@ -316,9 +400,7 @@ def build_knn_index(
             verbose=verbose,
         )
 
-    neighbors, distances = knn_index.build(data, k=k)
-
-    return knn_index, neighbors, distances
+    return knn_index
 
 
 def joint_probabilities_nn(
@@ -430,7 +512,7 @@ class FixedSigmaNN(Affinities):
 
     method: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
+        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
         if the input data matrix is not a sparse object and if Annoy supports
         the given metric. Otherwise it uses Pynndescent. ``auto`` uses exact
         nearest neighbors for N<1000 and the same heuristic as ``approx`` for N>=1000.
@@ -460,12 +542,17 @@ class FixedSigmaNN(Affinities):
 
     verbose: bool
 
+    knn_index: Optional[nearest_neighbors.KNNIndex]
+        Optionally, a precomptued ``openTSNE.nearest_neighbors.KNNIndex`` object
+        can be specified. This option will ignore any KNN-related parameters.
+        When ``knn_index`` is specified, ``data`` must be set to None.
+
     """
 
     def __init__(
         self,
-        data,
-        sigma,
+        data=None,
+        sigma=None,
         k=30,
         method="auto",
         metric="euclidean",
@@ -474,26 +561,47 @@ class FixedSigmaNN(Affinities):
         n_jobs=1,
         random_state=None,
         verbose=False,
+        knn_index=None,
     ):
-        self.n_samples = n_samples = data.shape[0]
-        self.verbose = verbose
+        # Sigma must be specified, but has default set to none, so the parameter
+        # order makes more sense
+        if sigma is None:
+            raise ValueError("`sigma` must be specified!")
 
-        if k >= self.n_samples:
+        # This can't work if neither data nor the knn index are specified
+        if data is None and knn_index is None:
             raise ValueError(
-                "`k` (%d) cannot be larger than N-1 (%d)." % (k, self.n_samples)
+                "At least one of the parameters `data` or `knn_index` must be specified!"
+            )
+        # This can't work if both data and the knn index are specified
+        if data is not None and knn_index is not None:
+            raise ValueError(
+                "Both `data` or `knn_index` were specified! Please pass only one."
             )
 
-        knn_index, neighbors, distances = build_knn_index(
-            data, method, k, metric, metric_params, n_jobs, random_state, self.verbose
-        )
+        # Find the nearest neighbors
+        if knn_index is None:
+            if k >= data.shape[0]:
+                raise ValueError(
+                    "`k` (%d) cannot be larger than N-1 (%d)." % (k, data.shape[0])
+                )
 
-        self.knn_index = knn_index
+            self.knn_index = get_knn_index(
+                data, method, k, metric, metric_params, n_jobs, random_state, verbose
+            )
 
-        with utils.Timer("Calculating affinity matrix...", self.verbose):
+        else:
+            self.knn_index = knn_index
+            log.info("KNN index provided. Ignoring KNN-related parameters.")
+
+        neighbors, distances = self.knn_index.build()
+
+        with utils.Timer("Calculating affinity matrix...", verbose):
             # Compute asymmetric pairwise input similarities
             conditional_P = np.exp(-(distances ** 2) / (2 * sigma ** 2))
             conditional_P /= np.sum(conditional_P, axis=1)[:, np.newaxis]
 
+            n_samples = self.knn_index.n_samples
             P = sp.csr_matrix(
                 (
                     conditional_P.ravel(),
@@ -511,9 +619,9 @@ class FixedSigmaNN(Affinities):
             P /= np.sum(P)
 
         self.sigma = sigma
-        self.k = k
         self.P = P
         self.n_jobs = n_jobs
+        self.verbose = verbose
 
     def to_new(self, data, k=None, sigma=None, return_distances=False):
         """Compute the affinities of new samples to the initial samples.
@@ -558,7 +666,7 @@ class FixedSigmaNN(Affinities):
         n_reference_samples = self.n_samples
 
         if k is None:
-            k = self.k
+            k = self.knn_index.k
         elif k >= n_reference_samples:
             raise ValueError(
                 "`k` (%d) cannot be larger than the number of reference "
@@ -615,11 +723,10 @@ class MultiscaleMixture(Affinities):
 
     method: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
+        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
         if the input data matrix is not a sparse object and if Annoy supports
         the given metric. Otherwise it uses Pynndescent. ``auto`` uses exact
         nearest neighbors for N<1000 and the same heuristic as ``approx`` for N>=1000.
-
 
     metric: Union[str, Callable]
         The metric to be used to compute affinities between points in the
@@ -645,12 +752,17 @@ class MultiscaleMixture(Affinities):
 
     verbose: bool
 
+    knn_index: Optional[nearest_neighbors.KNNIndex]
+        Optionally, a precomptued ``openTSNE.nearest_neighbors.KNNIndex`` object
+        can be specified. This option will ignore any KNN-related parameters.
+        When ``knn_index`` is specified, ``data`` must be set to None.
+
     """
 
     def __init__(
         self,
-        data,
-        perplexities,
+        data=None,
+        perplexities=None,
         method="auto",
         metric="euclidean",
         metric_params=None,
@@ -658,31 +770,59 @@ class MultiscaleMixture(Affinities):
         n_jobs=1,
         random_state=None,
         verbose=False,
+        knn_index=None,
     ):
-        self.n_samples = data.shape[0]
-        self.verbose = verbose
+        # Perplexities must be specified, but has default set to none, so the
+        # parameter order makes more sense
+        if perplexities is None:
+            raise ValueError("`perplexities` must be specified!")
 
-        # We will compute the nearest neighbors to the max value of perplexity,
-        # smaller values can just use indexing to truncate unneeded neighbors
-        perplexities = self.check_perplexities(perplexities)
-        max_perplexity = np.max(perplexities)
-        k_neighbors = min(self.n_samples - 1, int(3 * max_perplexity))
+        # This can't work if neither data nor the knn index are specified
+        if data is None and knn_index is None:
+            raise ValueError(
+                "At least one of the parameters `data` or `knn_index` must be specified!"
+            )
+        # This can't work if both data and the knn index are specified
+        if data is not None and knn_index is not None:
+            raise ValueError(
+                "Both `data` or `knn_index` were specified! Please pass only one."
+            )
 
-        self.knn_index, self.__neighbors, self.__distances = build_knn_index(
-            data, method, k_neighbors, metric, metric_params, n_jobs, random_state, verbose
-        )
+        # Find the nearest neighbors
+        if knn_index is None:
+            # We will compute the nearest neighbors to the max value of perplexity,
+            # smaller values can just use indexing to truncate unneeded neighbors
+            n_samples = data.shape[0]
+            effective_perplexities = self.check_perplexities(perplexities, n_samples)
+            max_perplexity = np.max(effective_perplexities)
+            k_neighbors = min(n_samples - 1, int(3 * max_perplexity))
 
-        with utils.Timer("Calculating affinity matrix...", self.verbose):
+            self.knn_index = get_knn_index(
+                data, method, k_neighbors, metric, metric_params, n_jobs, random_state, verbose
+            )
+
+        else:
+            self.knn_index = knn_index
+            n_samples = self.knn_index.n_samples
+            effective_perplexities = self.check_perplexities(perplexities, n_samples)
+            log.info("KNN index provided. Ignoring KNN-related parameters.")
+
+        self.__neighbors, self.__distances = self.knn_index.build()
+
+        with utils.Timer("Calculating affinity matrix...", verbose):
             self.P = self._calculate_P(
                 self.__neighbors,
                 self.__distances,
-                perplexities,
+                effective_perplexities,
                 symmetrize=symmetrize,
                 n_jobs=n_jobs,
             )
 
         self.perplexities = perplexities
+        self.effective_perplexities_ = effective_perplexities
+        self.symmetrize = symmetrize
         self.n_jobs = n_jobs
+        self.verbose = verbose
 
     @staticmethod
     def _calculate_P(
@@ -724,8 +864,8 @@ class MultiscaleMixture(Affinities):
         if np.array_equal(self.perplexities, new_perplexities):
             return
 
-        new_perplexities = self.check_perplexities(new_perplexities)
-        max_perplexity = np.max(new_perplexities)
+        effective_perplexities = self.check_perplexities(new_perplexities, self.n_samples)
+        max_perplexity = np.max(effective_perplexities)
         k_neighbors = min(self.n_samples - 1, int(3 * max_perplexity))
 
         if k_neighbors > self.__neighbors.shape[1]:
@@ -738,14 +878,15 @@ class MultiscaleMixture(Affinities):
             )
 
         self.perplexities = new_perplexities
+        self.effective_perplexities_ = effective_perplexities
         with utils.Timer(
             "Perplexity changed. Recomputing affinity matrix...", self.verbose
         ):
             self.P = self._calculate_P(
                 self.__neighbors[:, :k_neighbors],
                 self.__distances[:, :k_neighbors],
-                self.perplexities,
-                symmetrize=True,
+                self.effective_perplexities_,
+                symmetrize=self.symmetrize,
                 n_jobs=self.n_jobs,
             )
 
@@ -791,9 +932,9 @@ class MultiscaleMixture(Affinities):
 
         """
         perplexities = perplexities if perplexities is not None else self.perplexities
-        perplexities = self.check_perplexities(perplexities)
+        effective_perplexities = self.check_perplexities(perplexities, self.n_samples)
 
-        max_perplexity = np.max(perplexities)
+        max_perplexity = np.max(effective_perplexities)
         k_neighbors = min(self.n_samples - 1, int(3 * max_perplexity))
 
         neighbors, distances = self.knn_index.query(data, k_neighbors)
@@ -802,7 +943,7 @@ class MultiscaleMixture(Affinities):
             P = self._calculate_P(
                 neighbors,
                 distances,
-                perplexities,
+                effective_perplexities,
                 symmetrize=False,
                 normalization="point-wise",
                 n_reference_samples=self.n_samples,
@@ -814,7 +955,7 @@ class MultiscaleMixture(Affinities):
 
         return P
 
-    def check_perplexities(self, perplexities: Iterable[float]) -> Iterable[float]:
+    def check_perplexities(self, perplexities, n_samples):
         """Check and correct/truncate perplexities.
 
         If a perplexity is too large, it is corrected to the largest allowed
@@ -822,13 +963,16 @@ class MultiscaleMixture(Affinities):
         value doesn't already exist in the list.
 
         """
+        if isinstance(perplexities, numbers.Number):
+            perplexities = [perplexities]
+
         usable_perplexities = []
         for perplexity in sorted(perplexities):
             if perplexity <= 0:
                 raise ValueError("Perplexity must be >=0. %.2f given" % perplexity)
 
-            if 3 * perplexity > self.n_samples - 1:
-                new_perplexity = (self.n_samples - 1) / 3
+            if 3 * perplexity > n_samples - 1:
+                new_perplexity = (n_samples - 1) / 3
 
                 if new_perplexity in usable_perplexities:
                     log.warning(
@@ -870,11 +1014,10 @@ class Multiscale(MultiscaleMixture):
 
     method: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
+        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
         if the input data matrix is not a sparse object and if Annoy supports
         the given metric. Otherwise it uses Pynndescent. ``auto`` uses exact
         nearest neighbors for N<1000 and the same heuristic as ``approx`` for N>=1000.
-
 
     metric: Union[str, Callable]
         The metric to be used to compute affinities between points in the
@@ -899,6 +1042,11 @@ class Multiscale(MultiscaleMixture):
         number generator is the RandomState instance used by `np.random`.
 
     verbose: bool
+
+    knn_index: Optional[nearest_neighbors.KNNIndex]
+        Optionally, a precomptued ``openTSNE.nearest_neighbors.KNNIndex`` object
+        can be specified. This option will ignore any KNN-related parameters.
+        When ``knn_index`` is specified, ``data`` must be set to None.
 
     """
 
@@ -950,7 +1098,7 @@ class Uniform(Affinities):
 
     method: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
+        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
         if the input data matrix is not a sparse object and if Annoy supports
         the given metric. Otherwise it uses Pynndescent. ``auto`` uses exact
         nearest neighbors for N<1000 and the same heuristic as ``approx`` for N>=1000.
@@ -980,11 +1128,16 @@ class Uniform(Affinities):
 
     verbose: bool
 
+    knn_index: Optional[nearest_neighbors.KNNIndex]
+        Optionally, a precomptued ``openTSNE.nearest_neighbors.KNNIndex`` object
+        can be specified. This option will ignore any KNN-related parameters.
+        When ``knn_index`` is specified, ``data`` must be set to None.
+
     """
 
     def __init__(
         self,
-        data,
+        data=None,
         k_neighbors=30,
         method="auto",
         metric="euclidean",
@@ -993,28 +1146,45 @@ class Uniform(Affinities):
         n_jobs=1,
         random_state=None,
         verbose=False,
+        knn_index=None,
     ):
-        self.n_samples = data.shape[0]
-        self.k_neighbors = k_neighbors
-        self.verbose = verbose
-        self.n_jobs = n_jobs
-
-        if k_neighbors >= self.n_samples:
+        # This can't work if neither data nor the knn index are specified
+        if data is None and knn_index is None:
             raise ValueError(
-                "`k_neighbors` (%d) cannot be larger than N-1 (%d)." %
-                (k_neighbors, self.n_samples)
+                "At least one of the parameters `data` or `knn_index` must be specified!"
+            )
+        # This can't work if both data and the knn index are specified
+        if data is not None and knn_index is not None:
+            raise ValueError(
+                "Both `data` or `knn_index` were specified! Please pass only one."
             )
 
-        self.knn_index, neighbors, distances = build_knn_index(
-            data, method, k_neighbors, metric, metric_params, n_jobs, random_state, verbose
-        )
+        if knn_index is None:
+            if k_neighbors >= data.shape[0]:
+                raise ValueError(
+                    "`k_neighbors` (%d) cannot be larger than N-1 (%d)." %
+                    (k_neighbors, data.shape[0])
+                )
+
+            self.knn_index = get_knn_index(
+                data, method, k_neighbors, metric, metric_params, n_jobs, random_state, verbose
+            )
+
+        else:
+            self.knn_index = knn_index
+            log.info("KNN index provided. Ignoring KNN-related parameters.")
+
+        neighbors, distances = self.knn_index.build()
+
+        k_neighbors = self.knn_index.k
+        n_samples = self.knn_index.n_samples
         P = sp.csr_matrix(
             (
                 np.ones_like(distances).ravel(),
                 neighbors.ravel(),
-                range(0, self.n_samples * self.k_neighbors + 1, self.k_neighbors),
+                range(0, n_samples * k_neighbors + 1, k_neighbors),
             ),
-            shape=(self.n_samples, self.n_samples),
+            shape=(n_samples, n_samples),
         )
 
         # Symmetrize the probability matrix
@@ -1025,6 +1195,8 @@ class Uniform(Affinities):
         P /= np.sum(P)
 
         self.P = P
+        self.verbose = verbose
+        self.n_jobs = n_jobs
 
     def to_new(self, data, k_neighbors=None, return_distances=False):
         """Compute the affinities of new samples to the initial samples.
@@ -1066,7 +1238,7 @@ class Uniform(Affinities):
         n_reference_samples = self.n_samples
 
         if k_neighbors is None:
-            k_neighbors = self.k_neighbors
+            k_neighbors = self.knn_index.k
         elif k_neighbors >= n_reference_samples:
             raise ValueError(
                 "`k` (%d) cannot be larger than the number of reference "

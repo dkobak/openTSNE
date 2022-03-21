@@ -1,6 +1,7 @@
 from functools import wraps
 from time import time
 import warnings
+import numpy as np
 
 
 class Timer:
@@ -32,3 +33,28 @@ def deprecate_parameter(parameter):
             return f(*args, **kwargs)
         return func
     return wrapper
+
+
+def is_package_installed(libname):
+    """Check whether a python package is installed."""
+    import importlib
+
+    try:
+        importlib.import_module(libname)
+        return True
+    except ImportError:
+        return False
+
+
+def clip_point_to_disc(points, radius, inplace=False):
+    if not inplace:
+        points = points.copy()
+
+    r = np.linalg.norm(points, axis=1)
+    phi = np.arctan2(points[:, 0], points[:, 1])
+    mask = r > radius
+    np.clip(r, 0, radius, out=r)
+    points[:, 0] = r * np.sin(phi)
+    points[:, 1] = r * np.cos(phi)
+
+    return points, mask

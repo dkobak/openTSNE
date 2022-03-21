@@ -18,25 +18,31 @@ jobs:
 
     strategy:
       matrix:
-        osx - python36:
-          image.name: 'macos-10.14'
-          python.version: '3.6'
         osx - python37:
-          image.name: 'macos-10.14'
+          image.name: 'macOS-10.15'
           python.version: '3.7'
         osx - python38:
-          image.name: 'macos-10.14'
+          image.name: 'macOS-10.15'
           python.version: '3.8'
+        osx - python39:
+          image.name: 'macOS-10.15'
+          python.version: '3.9'
+        osx - python310:
+          image.name: 'macOS-10.15'
+          python.version: '3.10'
 
-        windows - python36:
-          image.name: 'vs2017-win2016'
-          python.version: '3.6'
         windows - python37:
-          image.name: 'vs2017-win2016'
+          image.name: 'windows-2019'
           python.version: '3.7'
         windows - python38:
-          image.name: 'vs2017-win2016'
+          image.name: 'windows-2019'
           python.version: '3.8'
+        windows - python39:
+          image.name: 'windows-2019'
+          python.version: '3.9'
+        windows - python310:
+          image.name: 'windows-2019'
+          python.version: '3.10'
 
     steps:
       - task: UsePythonVersion@0
@@ -45,17 +51,13 @@ jobs:
           architecture: 'x64'
         displayName: 'Use Python $(python.version)'
 
-      - script: |
-          python -m pip install --upgrade pip
-          python -m pip install setuptools wheel pytest
-          python -m pip install cython
-          python -m pip install numpy==1.14.6
-        displayName: 'Install job dependencies'
+      - script: env
+        displayName: 'List enviromental variables'
 
-      - script: python -m pip freeze
-        displayName: 'List dependency versions'
+      - script: python -m pip install build
+        displayName: Installing build tools
 
-      - script: python setup.py bdist_wheel
+      - script: python -m build -w .
         displayName: 'Build wheel'
 
       # Since Python automatically adds `cwd` to `sys.path`, it's important we remove the local folder
@@ -67,11 +69,18 @@ jobs:
       - bash: ls -lRh dist
         displayName: 'List built files'
 
-      - bash: python -m pip install -vv --force-reinstall --find-links dist openTSNE
+      - bash: python -m pip install --force-reinstall --find-links dist openTSNE
         displayName: 'Install wheel'
 
-      - script: python -m pip install pynndescent
-        displayName: 'Install optional dependencies'
+      - script: pip install pynndescent
+        displayName: 'Install optional dependencies - pynndescent'
+        condition: ne(variables['python.version'], '3.10')
+
+      - script: pip install hnswlib
+        displayName: 'Install optional dependencies - hnswlib'
+
+      - bash: pip install pytest
+        displayName: 'Install pytest'
 
       - script: pytest -v
         timeoutInMinutes: 15
@@ -95,33 +104,44 @@ jobs:
     cancelTimeoutInMinutes: 10
     displayName: 'Build wheels :: linux -'
     pool:
-      vmImage: 'Ubuntu-16.04'
+      vmImage: 'ubuntu-latest'
 
     strategy:
       matrix:
-        python36:
-          python: '/opt/python/cp36-cp36m/bin'
         python37:
           python: '/opt/python/cp37-cp37m/bin'
+          python.version: '3.7'
         python38:
           python: '/opt/python/cp38-cp38/bin'
+          python.version: '3.8'
+        python39:
+          python: '/opt/python/cp39-cp39/bin'
+          python.version: '3.9'
+        python310:
+          python: '/opt/python/cp310-cp310/bin'
+          python.version: '3.10'
 
     container:
-      image: quay.io/pypa/manylinux1_x86_64:latest
-      options: -e PLAT=manylinux1_x86_64
+      image: quay.io/pypa/manylinux2014_x86_64:latest
+      options: -e PLAT=manylinux2014_x86_64
 
     steps:
       - bash: ls -R /opt/python
         displayName: 'List available Python binaries'
 
-      - bash: $(python)/pip install --user pytest
-        displayName: 'Install job dependencies'
+      - script: $(python)/pip install --user build
+        displayName: 'Installing build tools'
 
-      # Build and install the wheel
-      - bash: .ci/build_wheels.sh
+      - script: $(python)/python -m build -w -o wheelhouse/ .
         displayName: 'Build wheels'
-        env:
-          PYBIN: $(python)
+
+      # Bundle external shared libraries into the wheels
+      - script: |
+          for whl in wheelhouse/openTSNE*.whl; do
+              auditwheel show "$whl"
+              auditwheel repair "$whl" --plat $PLAT -w wheelhouse/
+          done
+        displayName: 'Repair wheels'
 
       # Since Python automatically adds `cwd` to `sys.path`, it's important we remove the local folder
       # containing our code from the working directory. Otherwise, the tests will use the local copy
@@ -129,8 +149,18 @@ jobs:
       - bash: mv openTSNE src
         displayName: 'Remove source files from path'
 
+      - script: $(python)/pip install --force-reinstall --find-links wheelhouse openTSNE
+        displayName: 'Install openTSNE wheel'
+
       - script: $(python)/pip install pynndescent
-        displayName: 'Install optional dependencies'
+        displayName: 'Install optional dependencies - pynndescent'
+        condition: ne(variables['python.version'], '3.10')
+
+      - script: $(python)/pip install hnswlib
+        displayName: 'Install optional dependencies - hnswlib'
+
+      - bash: $(python)/pip install --user pytest
+        displayName: 'Install pytest'
 
       - script: $(python)/python -m pytest -v
         timeoutInMinutes: 15
@@ -160,25 +190,18 @@ jobs:
     cancelTimeoutInMinutes: 10
     displayName: 'Package source distribution'
     pool:
-      vmImage: 'Ubuntu-16.04'
+      vmImage: 'ubuntu-latest'
 
     steps:
       - task: UsePythonVersion@0
-        displayName: 'Use Python 3.7'
+        displayName: 'Use Python 3.8'
         inputs:
-          versionSpec: '3.7'
+          versionSpec: '3.8'
 
-      - script: |
-          python -m pip install --upgrade pip
-          python -m pip install setuptools wheel pytest
-          python -m pip install cython
-          python -m pip install numpy==1.14.6
-        displayName: 'Install job dependencies'
+      - script: python -m pip install build
+        displayName: Installing build tools
 
-      - script: python -m pip freeze
-        displayName: 'List dependency versions'
-
-      - script: python setup.py sdist
+      - script: python -m build -s .
         displayName: 'Build sdist'
 
       # Since Python automatically adds `cwd` to `sys.path`, it's important we remove the local folder
@@ -193,8 +216,15 @@ jobs:
       - bash: python -m pip install --force-reinstall --find-links dist openTSNE
         displayName: 'Install package'
 
-      - script: python -m pip install pynndescent
-        displayName: 'Install optional dependencies'
+      - script: pip install pynndescent
+        displayName: 'Install optional dependencies - pynndescent'
+        condition: ne(variables['python.version'], '3.10')
+
+      - script: pip install hnswlib
+        displayName: 'Install optional dependencies - hnswlib'
+
+      - bash: pip install pytest
+        displayName: 'Install pytest'
 
       - script: pytest -v
         timeoutInMinutes: 15

@@ -5,13 +5,18 @@ import sys
 import tempfile
 import warnings
 from distutils import ccompiler
-from distutils.command.build_ext import build_ext
 from distutils.errors import CompileError, LinkError
 from distutils.sysconfig import customize_compiler
 from os.path import join
 
 import setuptools
 from setuptools import setup, Extension
+
+try:
+    from Cython.Distutils.build_ext import new_build_ext as build_ext
+    have_cython = True
+except ImportError:
+    have_cython = False
 
 
 class ConvertNotebooksToDocs(distutils.cmd.Command):
@@ -121,28 +126,44 @@ def has_c_library(library, extension=".c"):
 
 class CythonBuildExt(build_ext):
     def build_extensions(self):
-        # Automatically append the file extension based on language.
-        # ``cythonize`` does this for us automatically, so it's not necessary if
-        # that was run
-        for extension in extensions:
-            for idx, source in enumerate(extension.sources):
-                base, ext = os.path.splitext(source)
-                if ext == ".pyx":
-                    base += ".cpp" if extension.language == "c++" else ".c"
-                    extension.sources[idx] = base
+        if not have_cython:
+            raise RuntimeError("Missing build dependency: Cython")
 
         extra_compile_args = []
         extra_link_args = []
 
         # Optimization compiler/linker flags are added appropriately
         compiler = self.compiler.compiler_type
-        if compiler == "unix" and platform.platform():
+        if compiler == "unix":
             extra_compile_args += ["-O3"]
-            # For some reason fast math causes segfaults on linux but works on mac
-            if platform.system() == "Darwin":
-                extra_compile_args += ["-ffast-math", "-fno-associative-math"]
         elif compiler == "msvc":
             extra_compile_args += ["/Ox", "/fp:fast"]
+
+        if compiler == "unix":
+            # https://stackoverflow.com/questions/22931147/stdisinf-does-not-work-with-ffast-math-how-to-check-for-infinity
+            extra_compile_args += [
+                "-ffast-math",
+                "-fno-finite-math-only",  # we use infinity
+                "-fno-associative-math",
+            ]
+
+        # Annoy specific flags
+        annoy_ext = None
+        for extension in extensions:
+            if "annoy.annoylib" in extension.name:
+                annoy_ext = extension
+        assert annoy_ext is not None, "Annoy extension not found!"
+
+        if compiler == "unix":
+            annoy_ext.extra_compile_args += ["-std=c++14"]
+            annoy_ext.extra_compile_args += ["-DANNOYLIB_MULTITHREADED_BUILD"]
+        elif compiler == "msvc":
+            annoy_ext.extra_compile_args += ["/std:c++14"]
+
+        # Set minimum deployment version for MacOS
+        if compiler == "unix" and platform.system() == "Darwin":
+            extra_compile_args += ["-mmacosx-version-min=10.12"]
+            extra_link_args += ["-stdlib=libc++", "-mmacosx-version-min=10.12"]
 
         # We don't want the compiler to optimize for system architecture if
         # we're building packages to be distributed by conda-forge, but if the
@@ -152,11 +173,6 @@ class CythonBuildExt(build_ext):
                 extra_compile_args += ["-mcpu=native"]
             if platform.machine() == "x86_64":
                 extra_compile_args += ["-march=native"]
-
-        # Annoy #349: something with OS X Mojave causes libstd not to be found
-        if platform.system() == "Darwin":
-            extra_compile_args += ["-std=c++11", "-mmacosx-version-min=10.9"]
-            extra_link_args += ["-stdlib=libc++", "-mmacosx-version-min=10.9"]
 
         # We will disable openmp flags if the compiler doesn"t support it. This
         # is only really an issue with OSX clang
@@ -216,7 +232,7 @@ extensions = [
     Extension("openTSNE.quad_tree", ["openTSNE/quad_tree.pyx"], language="c++"),
     Extension("openTSNE._tsne", ["openTSNE/_tsne.pyx"], language="c++"),
     Extension("openTSNE.kl_divergence", ["openTSNE/kl_divergence.pyx"], language="c++"),
-    annoy
+    annoy,
 ]
 
 
@@ -238,12 +254,6 @@ else:
         language="c++",
     )
     extensions.append(extension_)
-
-try:
-    from Cython.Build import cythonize
-    extensions = cythonize(extensions)
-except ImportError:
-    pass
 
 
 def readme():
@@ -271,7 +281,7 @@ setup(
         "Issue Tracker": "https://github.com/pavlin-policar/openTSNE/issues",
     },
     classifiers=[
-        "Development Status :: 4 - Beta",
+        "Development Status :: 5 - Production/Stable",
         "Intended Audience :: Science/Research",
         "Intended Audience :: Developers",
         "Topic :: Software Development",
@@ -290,11 +300,17 @@ setup(
     packages=setuptools.find_packages(include=["openTSNE", "openTSNE.*"]),
     python_requires=">=3.6",
     install_requires=[
-        "numpy>=1.14.6",
+        "numpy>=1.16.6",
         "scikit-learn>=0.20",
         "scipy",
     ],
-
+    setup_requires=[
+        "cython",
+    ],
+    extras_require={
+        "hnsw": "hnswlib~=0.4.0",
+        "pynndescent": "pynndescent~=0.5.0",
+    },
     ext_modules=extensions,
     cmdclass={"build_ext": CythonBuildExt, "convert_notebooks": ConvertNotebooksToDocs},
 )

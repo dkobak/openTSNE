@@ -1,7 +1,7 @@
 openTSNE
 ========
 
-|Build Status| |ReadTheDocs Badge| |Codacy Badge| |License Badge|
+|Build Status| |ReadTheDocs Badge| |License Badge|
 
 openTSNE is a modular Python implementation of t-Distributed Stochasitc Neighbor Embedding (t-SNE) [1]_, a popular dimensionality-reduction algorithm for visualizing high-dimensional data sets. openTSNE incorporates the latest improvements to the t-SNE algorithm, including the ability to add new data points to existing embeddings [2]_, massive speed improvements [3]_ [4]_, enabling t-SNE to scale to millions of data points and various tricks to improve global alignment of the resulting visualizations [5]_.
 
@@ -19,7 +19,7 @@ openTSNE is a modular Python implementation of t-Distributed Stochasitc Neighbor
 Installation
 ------------
 
-openTSNE requires Python 3.6 or higher in order to run.
+openTSNE requires Python 3.7 or higher in order to run.
 
 Conda
 ~~~~~
@@ -50,13 +50,12 @@ If you wish to install openTSNE from source, please run
 
 ::
 
-   python setup.py install
+   pip install .
 
 
 in the root directory to install the appropriate dependencies and compile the necessary binary files.
 
-Please note that openTSNE requires a C/C++ compiler to be available on the system. Additionally,
-``numpy`` must be pre-installed in the active environment.
+Please note that openTSNE requires a C/C++ compiler to be available on the system.
 
 In order for openTSNE to utilize multiple threads, the C/C++ compiler
 must support ``OpenMP``. In practice, almost all compilers
@@ -117,7 +116,7 @@ References
 .. [1] Van Der Maaten, Laurens, and Hinton, Geoffrey. `“Visualizing data using
     t-SNE.” <http://www.jmlr.org/papers/volume9/vandermaaten08a/vandermaaten08a.pdf>`__
     Journal of Machine Learning Research 9.Nov (2008): 2579-2605.
-.. [2] Poličar, Pavlin G., Martin Stražar, and Blaž Zupan. `“Embedding to Reference t-SNE Space Addresses Batch Effects in Single-Cell Classification.” <https://www.biorxiv.org/content/10.1101/671404v1.abstract>`__ BioRxiv (2019): 671404.
+.. [2] Poličar, Pavlin G., Martin Stražar, and Blaž Zupan. `“Embedding to Reference t-SNE Space Addresses Batch Effects in Single-Cell Classification.” <https://link.springer.com/article/10.1007/s10994-021-06043-1>`__ Machine Learning (2021): 1-20.
 .. [3] Van Der Maaten, Laurens. `“Accelerating t-SNE using tree-based algorithms.”
     <http://www.jmlr.org/papers/volume15/vandermaaten14a/vandermaaten14a.pdf>`__
     Journal of Machine Learning Research 15.1 (2014): 3221-3245.
@@ -135,7 +134,5 @@ References
 .. |ReadTheDocs Badge| image:: https://readthedocs.org/projects/opentsne/badge/?version=latest
    :target: https://opentsne.readthedocs.io/en/latest/?badge=latest
    :alt: Documentation Status
-.. |Codacy Badge| image:: https://api.codacy.com/project/badge/Grade/ef67c21a74924b548acae5a514bc443d
-   :target: https://app.codacy.com/app/pavlin-policar/openTSNE?utm_source=github.com&utm_medium=referral&utm_content=pavlin-policar/openTSNE&utm_campaign=Badge_Grade_Dashboard
 .. |License Badge| image:: https://img.shields.io/badge/License-BSD%203--Clause-blue.svg
    :target: https://opensource.org/licenses/BSD-3-Clause
