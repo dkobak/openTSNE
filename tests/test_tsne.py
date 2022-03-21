@@ -7,14 +7,19 @@ from typing import Callable, Any, Tuple, Optional
 from unittest.mock import patch, MagicMock
 
 import numpy as np
+from scipy.spatial.distance import pdist, squareform
 from sklearn import datasets
+from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier
 
 import openTSNE
-from openTSNE import affinity, initialization
+from openTSNE import affinity
+from openTSNE import initialization
 from openTSNE.affinity import PerplexityBasedNN
 from openTSNE.nearest_neighbors import NNDescent
 from openTSNE.tsne import kl_divergence_bh, kl_divergence_fft
+from openTSNE.utils import is_package_installed
 
 np.random.seed(42)
 affinity.log.setLevel(logging.ERROR)
@@ -216,6 +221,7 @@ class TestTSNEParameterFlow(unittest.TestCase):
         check_call_contains_kwargs(gradient_descent.mock_calls[0], params)
 
     @check_params({"metric": set(NNDescent.VALID_METRICS) - {"mahalanobis"}})
+    @unittest.skipIf(not is_package_installed("pynndescent"), "`pynndescent`is not installed")
     @patch("pynndescent.NNDescent")
     def test_nndescent_distances(self, param_name, metric, nndescent: MagicMock):
         """Distance metrics should be properly passed down to NN descent"""
@@ -234,6 +240,7 @@ class TestTSNEParameterFlow(unittest.TestCase):
         self.assertEqual(nndescent.call_count, 1)
         check_call_contains_kwargs(nndescent.mock_calls[0], {"metric": metric})
 
+    @unittest.skipIf(not is_package_installed("pynndescent"), "`pynndescent`is not installed")
     @patch("pynndescent.NNDescent")
     def test_nndescent_mahalanobis_distance(self, nndescent: MagicMock):
         """Distance metrics and additional params should be correctly passed down to NN descent"""
@@ -383,25 +390,52 @@ class TestTSNECallbackParams(unittest.TestCase):
         self.assertEqual(callback.call_count, 1)
 
 
-class TestAffinityAsParameter(unittest.TestCase):
-    def test_fails_if_incorrect_class(self):
-        aff = "definitely not an instance of Affinity"
+class TestAlternativeFitUsageWithAffinityAndInitialization(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.x = np.random.normal(100, 50, (25, 4))
+        cls.init = np.random.normal(0, 1e-4, (25, 2))
+
+    def test_fails_if_no_parameters_specified(self):
+        tsne = TSNE()
         with self.assertRaises(ValueError):
-            TSNE(affinities=aff)
+            tsne.fit()
 
-    def test_affinities_passed_to_embedding(self):
-        x = np.random.normal(100, 50, (25, 4))
-        aff = affinity.PerplexityBasedNN(x, 5, method="exact")
-        tsne = TSNE(affinities=aff)
-        embedding = tsne.prepare_initial(x)
+    def test_precomputed_affinity_is_passed_to_embedding_object(self):
+        aff = affinity.PerplexityBasedNN(self.x, 5, method="exact")
+        embedding = TSNE(
+            early_exaggeration_iter=0, n_iter=0, initialization=self.init
+        ).fit(affinities=aff)
         self.assertIs(embedding.affinities, aff)
 
-    def test_optimize_runs_properly(self):
-        x = np.random.normal(100, 50, (25, 4))
-        aff = affinity.PerplexityBasedNN(x, 5, method="exact")
-        tsne = TSNE(affinities=aff)
-        embedding = tsne.fit(x)
-        self.assertIs(embedding.affinities, aff)
+    def test_fails_if_affinities_parameter_is_not_correct_class(self):
+        aff = "definitely not an affinity object"
+        with self.assertRaises(ValueError):
+            TSNE(initialization=self.init).fit(affinities=aff)
+
+    def test_precomputed_initialization_is_passed_to_embedding_object(self):
+        embedding = TSNE(early_exaggeration_iter=0, n_iter=0) \
+            .fit(self.x, initialization=self.init)
+        np.testing.assert_array_equal(embedding, self.init)
+
+    def test_string_initialization(self):
+        # This should not crash
+        TSNE(early_exaggeration_iter=0, n_iter=0).fit(self.x, initialization="pca")
+
+    def test_parameter_init_takes_precendence_over_constructor_init(self):
+        constructor_init = np.random.normal(1, 1e-4, self.init.shape)
+        embedding = TSNE(
+            early_exaggeration_iter=0, n_iter=0, initialization=constructor_init
+        ).fit(self.x, initialization=self.init)
+        np.testing.assert_array_equal(embedding, self.init)
+
+    def test_pca_init_with_only_affinities_passed(self):
+        aff = affinity.PerplexityBasedNN(self.x, 5, method="exact")
+        desired_init = initialization.spectral(aff.P)
+        embedding = TSNE(
+            early_exaggeration_iter=0, n_iter=0, initialization="pca"
+        ).fit(affinities=aff)
+        np.testing.assert_array_equal(embedding, desired_init)
 
 
 class TSNEInitialization(unittest.TestCase):
@@ -558,7 +592,7 @@ class TestRandomState(unittest.TestCase):
         )
 
     @patch("openTSNE.initialization.random", wraps=openTSNE.initialization.random)
-    @patch("openTSNE.nearest_neighbors.BallTree", wraps=openTSNE.nearest_neighbors.BallTree)
+    @patch("openTSNE.nearest_neighbors.Sklearn", wraps=openTSNE.nearest_neighbors.Sklearn)
     def test_random_state_parameter_is_propagated_random_init_exact(self, init, neighbors):
         random_state = 1
 
@@ -576,12 +610,12 @@ class TestRandomState(unittest.TestCase):
         check_mock_called_with_kwargs(neighbors, {"random_state": random_state})
 
     @patch("openTSNE.initialization.pca", wraps=openTSNE.initialization.pca)
-    @patch("openTSNE.nearest_neighbors.NNDescent", wraps=openTSNE.nearest_neighbors.NNDescent)
+    @patch("openTSNE.nearest_neighbors.Annoy", wraps=openTSNE.nearest_neighbors.Annoy)
     def test_random_state_parameter_is_propagated_pca_init_approx(self, init, neighbors):
         random_state = 1
 
         tsne = openTSNE.TSNE(
-            neighbors="pynndescent",
+            neighbors="approx",
             initialization="pca",
             random_state=random_state,
         )
@@ -669,33 +703,39 @@ class TestGradientDescentOptimizer(unittest.TestCase):
     def test_optimizer_being_passed_to_subsequent_embeddings(self):
         embedding = self.tsne.prepare_initial(self.x)
 
-        self.assertIsNone(embedding.optimizer.gains,
-                          "Optimizer should be initialized with no gains")
+        self.assertIsNone(
+            embedding.optimizer.gains, "Optimizer should be initialized with no gains"
+        )
 
         # Check the switch from no gains to some gains
         embedding1 = embedding.optimize(10)
         self.assertIsNone(
             embedding.optimizer.gains,
             "Gains changed on initial optimizer even though we did not do "
-            "inplace optimization.")
+            "inplace optimization.",
+        )
         self.assertIsNotNone(
-            embedding1.optimizer.gains,
-            "Gains were not properly set in new embedding.")
+            embedding1.optimizer.gains, "Gains were not properly set in new embedding."
+        )
         self.assertIsNot(
-            embedding.optimizer, embedding1.optimizer,
+            embedding.optimizer,
+            embedding1.optimizer,
             "The embedding and new embedding optimizer are the same instance "
-            "even we did not do inplace optimization.")
+            "even we did not do inplace optimization.",
+        )
 
         # Check switch from existing gains to new gains
         embedding2 = embedding1.optimize(10)
         self.assertIsNot(
-            embedding1.optimizer, embedding2.optimizer,
+            embedding1.optimizer,
+            embedding2.optimizer,
             "The embedding and new embedding optimizer are the same instance "
-            "even we did not do inplace optimization.")
+            "even we did not do inplace optimization.",
+        )
         self.assertFalse(
             np.allclose(embedding1.optimizer.gains, embedding2.optimizer.gains),
             "The gains in the new embedding did not change at all from the old "
-            "embedding."
+            "embedding.",
         )
 
     def test_optimizer_being_passed_to_partial_embeddings(self):
@@ -705,32 +745,39 @@ class TestGradientDescentOptimizer(unittest.TestCase):
         # Partial embeddings get their own optimizer instance
         partial = embedding.prepare_partial(self.x_test)
         self.assertIsNot(
-            embedding.optimizer, partial.optimizer,
-            "Embedding and partial embedding optimizers are the same instance.")
+            embedding.optimizer,
+            partial.optimizer,
+            "Embedding and partial embedding optimizers are the same instance.",
+        )
         self.assertIsNone(
             partial.optimizer.gains,
-            "Partial embedding was not initialized with no gains")
+            "Partial embedding was not initialized with no gains",
+        )
 
         # Check the switch from no gains to some gains
         partial1 = partial.optimize(10)
         self.assertIsNone(
             partial.optimizer.gains,
             "Gains on initial optimizer changed even though we did not do "
-            "inplace optimization.")
+            "inplace optimization.",
+        )
         self.assertIsNotNone(
             partial1.optimizer.gains,
-            "Gains were not properly set in new partial embedding.")
+            "Gains were not properly set in new partial embedding.",
+        )
 
         # Check switch from existing gains to new gains
         partial2 = partial1.optimize(10)
         self.assertIsNot(
-            partial1.optimizer, partial2.optimizer,
+            partial1.optimizer,
+            partial2.optimizer,
             "The embedding and new embedding optimizer are the same instance "
-            "even we did not do inplace optimization.")
+            "even we did not do inplace optimization.",
+        )
         self.assertFalse(
             np.allclose(partial1.optimizer.gains, partial2.optimizer.gains),
             "The gains in the new embedding did not change at all from the old "
-            "embedding."
+            "embedding.",
         )
 
     def test_embedding_optimizer_inplace(self):
@@ -761,6 +808,37 @@ class TestGradientDescentOptimizer(unittest.TestCase):
         loaded_obj = pickle.loads(pickle.dumps(obj))
         np.testing.assert_array_equal(loaded_obj.gains, np.ones(5))
 
+    def test_gains_is_always_numpy_array(self):
+        embedding = self.tsne.prepare_initial(self.x)
+        self.assertIsInstance(embedding.optimizer.gains, (type(None), np.ndarray))
+        self.assertNotIsInstance(embedding.optimizer.gains, openTSNE.TSNEEmbedding)
+
+        embedding = embedding.optimize(10)
+        self.assertIsInstance(embedding.optimizer.gains, (type(None), np.ndarray))
+        self.assertNotIsInstance(embedding.optimizer.gains, openTSNE.TSNEEmbedding)
+
+        embedding.optimize(10, inplace=True)
+        self.assertIsInstance(embedding.optimizer.gains, (type(None), np.ndarray))
+        self.assertNotIsInstance(embedding.optimizer.gains, openTSNE.TSNEEmbedding)
+
+    def test_pickling_via_embedding(self):
+        embedding = self.tsne.prepare_initial(self.x)
+        # Before optimization
+        loaded_embedding = pickle.loads(pickle.dumps(embedding))
+        np.testing.assert_equal(
+            embedding.optimizer.gains,
+            loaded_embedding.optimizer.gains,
+            "Failed loading without any optimization",
+        )
+
+        # After optimization
+        loaded_embedding = pickle.loads(pickle.dumps(embedding))
+        np.testing.assert_equal(
+            embedding.optimizer.gains,
+            loaded_embedding.optimizer.gains,
+            "Failed loading after optimization (differing gains)",
+        )
+
 
 class TestAffinityIntegration(unittest.TestCase):
     @classmethod
@@ -779,11 +857,20 @@ class TestAffinityIntegration(unittest.TestCase):
         # This should not raise an error
         embedding.transform(self.x_test)
 
+    def test_transform_with_multiscale_affinity(self):
+        init = openTSNE.initialization.random(self.x)
+        aff = openTSNE.affinity.Multiscale(self.x, [2, 5], method="exact")
+        embedding = openTSNE.TSNEEmbedding(init, aff, negative_gradient_method="bh")
+        embedding.optimize(100, inplace=True)
+
+        # This should not raise an error
+        embedding.transform(self.x_test)
+
     def test_transform_with_nonstandard_affinity(self):
         """Should raise an informative error when a non-standard affinity is used
         with `transform`."""
         init = openTSNE.initialization.random(self.x)
-        aff = openTSNE.affinity.Multiscale(self.x, [2, 5], method="exact")
+        aff = openTSNE.affinity.Uniform(self.x, 5, method="exact")
         embedding = openTSNE.TSNEEmbedding(init, aff, negative_gradient_method="bh")
         embedding.optimize(100, inplace=True)
 
@@ -805,3 +892,72 @@ class TestTSNEEmebedding(unittest.TestCase):
         embedding: openTSNE.TSNEEmbedding = tsne.fit(np.random.randn(100, 4))
         loaded_obj: openTSNE.TSNEEmbedding = pickle.loads(pickle.dumps(embedding))
         loaded_obj.transform(np.random.randn(100, 4))
+
+
+class TestPrecomputedDistanceMatrices(unittest.TestCase):
+    def test_precomputed_dist_matrix_via_affinities_uses_spectral_init(self):
+        x = np.random.normal(0, 1, (200, 5))
+        d = squareform(pdist(x))
+
+        aff = affinity.PerplexityBasedNN(d, metric="precomputed")
+        desired_init = initialization.spectral(aff.P)
+        embedding = TSNE(early_exaggeration_iter=0, n_iter=0).fit(affinities=aff)
+        np.testing.assert_array_equal(embedding, desired_init)
+
+    def test_precomputed_dist_matrix_via_tsne_interface_uses_spectral_init(self):
+        x = np.random.normal(0, 1, (200, 5))
+        d = squareform(pdist(x))
+
+        aff = affinity.PerplexityBasedNN(d, metric="precomputed")
+        desired_init = initialization.spectral(aff.P)
+        embedding = TSNE(metric="precomputed", early_exaggeration_iter=0, n_iter=0) \
+            .fit(d)
+        np.testing.assert_array_equal(embedding, desired_init)
+
+    def test_precomputed_dist_matrix_doesnt_override_valid_inits(self):
+        iris = datasets.load_iris()
+        x, y = iris.data, iris.target
+        d = squareform(pdist(x))
+
+        embedding = TSNE(
+            initialization="random",
+            metric="precomputed",
+            early_exaggeration_iter=0,
+            n_iter=0
+        ).fit(d)
+
+        knn = KNeighborsClassifier(n_neighbors=10)
+        knn.fit(embedding, y)
+        predictions = knn.predict(embedding)
+        self.assertLess(accuracy_score(predictions, y), 0.55)
+
+
+class TestMisc(unittest.TestCase):
+    def test_very_large_affinity_matrices(self):
+        x = np.random.normal(0, 1, (50, 10))
+        aff = PerplexityBasedNN(x, perplexity=30)
+
+        # Super large affinity matrices have so many indices, it needs to be
+        # stored as long
+        aff.P.indptr = aff.P.indptr.astype(np.int64)
+        aff.P.indices = aff.P.indices.astype(np.int64)
+
+        TSNE().fit(x, affinities=aff)
+
+        # The old version should still work
+        aff.P.indptr = aff.P.indptr.astype(np.int32)
+        aff.P.indices = aff.P.indices.astype(np.int32)
+
+        TSNE().fit(x, affinities=aff)
+
+    def test_interpolation_grid_not_called_using_bh(self):
+        x1 = np.random.normal(0, 1, (50, 10))
+        x2 = np.random.normal(0, 1, (20, 10))
+
+        with patch("openTSNE.TSNEEmbedding.prepare_interpolation_grid") as prep_grid:
+            tsne = openTSNE.TSNE(negative_gradient_method="bh")
+            embedding = tsne.fit(x1)
+            # Calling transform shouldn't call `prepare_interpolation_grid`
+            embedding.transform(x2)
+
+            prep_grid.assert_not_called()

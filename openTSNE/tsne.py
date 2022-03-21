@@ -1,7 +1,7 @@
 import inspect
 import logging
 import multiprocessing
-from collections import Iterable
+from collections.abc import Iterable
 from types import SimpleNamespace
 from time import time
 
@@ -10,7 +10,7 @@ from sklearn.base import BaseEstimator
 
 from openTSNE import _tsne
 from openTSNE import initialization as initialization_scheme
-from openTSNE.affinity import Affinities, PerplexityBasedNN
+from openTSNE.affinity import Affinities, MultiscaleMixture
 from openTSNE.quad_tree import QuadTree
 from openTSNE import utils
 
@@ -37,12 +37,23 @@ def _check_callbacks(callbacks):
 def _handle_nice_params(embedding: np.ndarray, optim_params: dict) -> None:
     """Convert the user friendly params into something the optimizer can
     understand."""
+    n_samples = embedding.shape[0]
     # Handle callbacks
     optim_params["callbacks"] = _check_callbacks(optim_params.get("callbacks"))
     optim_params["use_callbacks"] = optim_params["callbacks"] is not None
 
     # Handle negative gradient method
     negative_gradient_method = optim_params.pop("negative_gradient_method")
+    # Handle `auto` negative gradient method
+    if isinstance(negative_gradient_method, str) and negative_gradient_method == "auto":
+        if n_samples < 10_000:
+            negative_gradient_method = "bh"
+        else:
+            negative_gradient_method = "fft"
+        log.info(
+            f"Automatically determined negative gradient method `{negative_gradient_method}`"
+        )
+
     if callable(negative_gradient_method):
         negative_gradient_method = negative_gradient_method
     elif negative_gradient_method in {"bh", "BH", "barnes-hut"}:
@@ -78,7 +89,7 @@ def _handle_nice_params(embedding: np.ndarray, optim_params: dict) -> None:
 
     # Determine learning rate if requested
     if optim_params.get("learning_rate", "auto") == "auto":
-        optim_params["learning_rate"] = max(200, embedding.shape[0] / 12)
+        optim_params["learning_rate"] = max(200, n_samples / 12)
 
 
 def __check_init_num_samples(num_samples, required_num_samples):
@@ -169,7 +180,8 @@ class PartialTSNEEmbedding(np.ndarray):
         using one of the following aliases: ``bh``, ``BH`` or ``barnes-hut``.
         For larger data sets, the FFT accelerated interpolation method is more
         appropriate and can be set using one of the following aliases: ``fft``,
-        ``FFT`` or ``ìnterpolation``.
+        ``FFT`` or ``ìnterpolation``. Alternatively, you can use ``auto`` to
+        approximately select the faster method.
 
     theta: float
         This is the trade-off parameter between speed and accuracy of the tree
@@ -290,6 +302,8 @@ class PartialTSNEEmbedding(np.ndarray):
             ``barnes-hut``. For larger data sets, the FFT accelerated
             interpolation method is more appropriate and can be set using one of
             the following aliases: ``fft``, ``FFT`` or ``ìnterpolation``.
+            Alternatively, you can use ``auto`` to approximately select the
+            faster method.
 
         theta: float
             This is the trade-off parameter between speed and accuracy of the
@@ -317,14 +331,6 @@ class PartialTSNEEmbedding(np.ndarray):
             The optimization process can be interrupted using callbacks. This
             flag indicates whether we should propagate that exception or to
             simply stop optimization and return the resulting embedding.
-
-        random_state: Union[int, RandomState]
-            The random state parameter follows the convention used in
-            scikit-learn. If the value is an int, random_state is the seed used
-            by the random number generator. If the value is a RandomState
-            instance, then it will be used as the random number generator. If
-            the value is None, the random number generator is the RandomState
-            instance used by `np.random`.
 
         n_jobs: int
             The number of threads to use while running t-SNE. This follows the
@@ -431,7 +437,8 @@ class TSNEEmbedding(np.ndarray):
         using one of the following aliases: ``bh``, ``BH`` or ``barnes-hut``.
         For larger data sets, the FFT accelerated interpolation method is more
         appropriate and can be set using one of the following aliases: ``fft``,
-        ``FFT`` or ``ìnterpolation``.
+        ``FFT`` or ``ìnterpolation``.A lternatively, you can use ``auto`` to
+        approximately select the faster method.
 
     theta: float
         This is the trade-off parameter between speed and accuracy of the tree
@@ -490,7 +497,7 @@ class TSNEEmbedding(np.ndarray):
         n_interpolation_points=3,
         min_num_intervals=50,
         ints_in_interval=1,
-        negative_gradient_method="fft",
+        negative_gradient_method="auto",
         random_state=None,
         optimizer=None,
         **gradient_descent_params,
@@ -571,6 +578,8 @@ class TSNEEmbedding(np.ndarray):
             ``barnes-hut``. For larger data sets, the FFT accelerated
             interpolation method is more appropriate and can be set using one of
             the following aliases: ``fft``, ``FFT`` or ``ìnterpolation``.
+            Alternatively, you can use ``auto`` to approximately select the
+            faster method.
 
         theta: float
             This is the trade-off parameter between speed and accuracy of the
@@ -611,14 +620,6 @@ class TSNEEmbedding(np.ndarray):
             Maximum update norm. If the norm exceeds this value, it will be
             clipped. This prevents points from "shooting off" from
             the embedding.
-
-        random_state: Union[int, RandomState]
-            The random state parameter follows the convention used in
-            scikit-learn. If the value is an int, random_state is the seed used
-            by the random number generator. If the value is a RandomState
-            instance, then it will be used as the random number generator. If
-            the value is None, the random number generator is the RandomState
-            instance used by `np.random`.
 
         n_jobs: int
             The number of threads to use while running t-SNE. This follows the
@@ -780,24 +781,26 @@ class TSNEEmbedding(np.ndarray):
 
         """
 
-        # We check if the affinity `to_new` methods takes the `perplexity`
-        # parameter and raise an informative error if not. This happes when the
-        # user uses a non-standard affinity class e.g. multiscale, then attempts
-        # to add points via `transform`. These classes take `perplexities` and
-        # fail
+        # Since the standard usage of t-SNE uses perplexities, check if the
+        # currently used affinity class supports either the `perplexity` or
+        # `perplexities` parameters.
         affinity_signature = inspect.signature(self.affinities.to_new)
-        if "perplexity" not in affinity_signature.parameters:
+        if "perplexity" in affinity_signature.parameters:
+            affinity_params = {"perplexity": perplexity}
+        elif "perplexities" in affinity_signature.parameters:
+            affinity_params = {"perplexities": perplexity}
+        else:
             raise TypeError(
-                "`transform` currently does not support non `%s` type affinity "
-                "classes. Please use `prepare_partial` and `optimize` to add "
-                "points to the embedding." % PerplexityBasedNN.__name__
+                f"`transform` currently does not support "
+                f"{self.affinities.__class__.__name__} affinities. Please use "
+                f"`prepare_partial` and `optimize` to add points to the embedding."
             )
 
         # Center the current embedding
         self -= (np.max(self, axis=0) + np.min(self, axis=0)) / 2
 
         embedding = self.prepare_partial(
-            X, perplexity=perplexity, initialization=initialization, k=k
+            X, initialization=initialization, k=k, **affinity_params
         )
 
         try:
@@ -860,6 +863,20 @@ class TSNEEmbedding(np.ndarray):
             optimization.
 
         """
+
+        # To maintain perfect backwards compatibility and to handle the very
+        # specific case when the user wants to pass in `perplexity` to the
+        # multiscale affinity object (multiscale accepts `perplexities`), rename
+        # this parameter so everything works
+        affinity_signature = inspect.signature(self.affinities.to_new)
+        if (
+            "perplexities" in affinity_signature.parameters and
+            "perplexities" in affinity_signature.parameters and
+            "perplexity" in affinity_params and
+            "perplexities" not in affinity_params
+        ):
+            affinity_params["perplexities"] = affinity_params.pop("perplexity")
+
         P, neighbors, distances = self.affinities.to_new(
             X, return_distances=True, **affinity_params
         )
@@ -931,6 +948,7 @@ class TSNEEmbedding(np.ndarray):
     def __reduce__(self):
         state = super().__reduce__()
         new_state = state[2] + (
+            self.optimizer,
             self.affinities,
             self.gradient_descent_params,
             self.random_state,
@@ -949,7 +967,13 @@ class TSNEEmbedding(np.ndarray):
         self.random_state = state[-5]
         self.gradient_descent_params = state[-6]
         self.affinities = state[-7]
-        super().__setstate__(state[0:-7])
+
+        if len(state) == 12:  # backwards compat (when I forgot optimizer)
+            self.optimizer = gradient_descent()
+            super().__setstate__(state[:-7])
+        else:
+            self.optimizer = state[-8]
+            super().__setstate__(state[:-8])
 
 
 class TSNE(BaseEstimator):
@@ -1000,7 +1024,8 @@ class TSNE(BaseEstimator):
         This is the trade-off parameter between speed and accuracy of the tree
         approximation method. Typical values range from 0.2 to 0.8. The value 0
         indicates that no approximation is to be made and produces exact results
-        also producing longer runtime.
+        also producing longer runtime. Alternatively, you can use ``auto`` to
+        approximately select the faster method.
 
     n_interpolation_points: int
         Only used when ``negative_gradient_method="fft"`` or its other aliases.
@@ -1058,14 +1083,9 @@ class TSNE(BaseEstimator):
         scikit-learn convention, ``-1`` meaning all processors, ``-2`` meaning
         all but one, etc.
 
-    affinities: openTSNE.affinity.Affinities
-        A precomputed affinity object. If specified, other affinity-related
-        parameters are ignored e.g. `perplexity` and anything nearest-neighbor
-        search related.
-
     neighbors: str
         Specifies the nearest neighbor method to use. Can be ``exact``, ``annoy``,
-        ``pynndescent``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
+        ``pynndescent``, ``hnsw``, ``approx``, or ``auto`` (default). ``approx`` uses Annoy
         if the input data matrix is not a sparse object and if Annoy supports
         the given metric. Otherwise it uses Pynndescent. ``auto`` uses exact
         nearest neighbors for N<1000 and the same heuristic as ``approx`` for N>=1000.
@@ -1076,7 +1096,8 @@ class TSNE(BaseEstimator):
         using one of the following aliases: ``bh``, ``BH`` or ``barnes-hut``.
         For larger data sets, the FFT accelerated interpolation method is more
         appropriate and can be set using one of the following aliases: ``fft``,
-        ``FFT`` or ``ìnterpolation``.
+        ``FFT`` or ``ìnterpolation``. Alternatively, you can use ``auto`` to
+        approximately select the faster method.
 
     callbacks: Union[Callable, List[Callable]]
         Callbacks, which will be run every ``callbacks_every_iters`` iterations.
@@ -1117,9 +1138,8 @@ class TSNE(BaseEstimator):
         max_grad_norm=None,
         max_step_norm=5,
         n_jobs=1,
-        affinities=None,
         neighbors="auto",
-        negative_gradient_method="fft",
+        negative_gradient_method="auto",
         callbacks=None,
         callbacks_every_iters=50,
         random_state=None,
@@ -1152,13 +1172,7 @@ class TSNE(BaseEstimator):
         self.max_step_norm = max_step_norm
         self.n_jobs = n_jobs
 
-        if affinities is not None and not isinstance(affinities, Affinities):
-            raise ValueError(
-                "`affinities` must be an instance of `openTSNE.affinity.Affinities`"
-            )
-        self.affinities = affinities
-
-        self.neighbors_method = neighbors
+        self.neighbors = neighbors
         self.negative_gradient_method = negative_gradient_method
 
         self.callbacks = callbacks
@@ -1169,16 +1183,41 @@ class TSNE(BaseEstimator):
         
         self.constrain = constrain
 
-    def fit(self, X):
+    def fit(self, X=None, affinities=None, initialization=None):
         """Fit a t-SNE embedding for a given data set.
 
         Runs the standard t-SNE optimization, consisting of the early
         exaggeration phase and a normal optimization phase.
 
+        This function call be called in two ways.
+
+        1.  We can call it in the standard way using a ``np.array``. This will
+            compute the affinity matrix and initialization, and run the optimization
+            as usual.
+        2.  We can also pass in a precomputed ``affinity`` object, which will
+            override the affinity-related paramters specified in the constructor.
+            This is useful when you wish to use custom affinity objects.
+
+        Please note that some initialization schemes require ``X`` to be specified,
+        e.g. PCA. If the initilization is not able to be computed, we default to
+        using spectral initilization calculated from the affinity matrix.
+
         Parameters
         ----------
-        X: np.ndarray
+        X: Optional[np.ndarray}
             The data matrix to be embedded.
+
+        affinities: Optional[openTSNE.affinity.Affinities]
+            A precomputed affinity object. If specified, other affinity-related
+            parameters are ignored e.g. `perplexity` and anything nearest-neighbor
+            search related.
+
+        initialization: Optional[np.ndarray]
+            The initial point positions to be used in the embedding space. Can be
+            a precomputed numpy array, ``pca``, ``spectral`` or ``random``. Please
+            note that when passing in a precomputed positions, it is highly
+            recommended that the point positions have small variance
+            (std(Y) < 0.0001), otherwise you may get poor embeddings.
 
         Returns
         -------
@@ -1189,7 +1228,7 @@ class TSNE(BaseEstimator):
         if self.verbose:
             print("-" * 80, repr(self), "-" * 80, sep="\n")
 
-        embedding = self.prepare_initial(X)
+        embedding = self.prepare_initial(X, affinities, initialization)
 
         try:
             # Early exaggeration with lower momentum to allow points to find more
@@ -1218,13 +1257,37 @@ class TSNE(BaseEstimator):
 
         return embedding
 
-    def prepare_initial(self, X):
+    def prepare_initial(self, X=None, affinities=None, initialization=None):
         """Prepare the initial embedding which can be optimized as needed.
+
+        This function call be called in two ways.
+
+        1.  We can call it in the standard way using a ``np.array``. This will
+            compute the affinity matrix and initialization as usual.
+        2.  We can also pass in a precomputed ``affinity`` object, which will
+            override the affinity-related paramters specified in the constructor.
+            This is useful when you wish to use custom affinity objects.
+
+        Please note that some initialization schemes require ``X`` to be specified,
+        e.g. PCA. If the initilization is not able to be computed, we default to
+        using spectral initilization calculated from the affinity matrix.
 
         Parameters
         ----------
-        X: np.ndarray
+        X: Optional[np.ndarray}
             The data matrix to be embedded.
+
+        affinities: Optional[openTSNE.affinity.Affinities]
+            A precomputed affinity object. If specified, other affinity-related
+            parameters are ignored e.g. `perplexity` and anything nearest-neighbor
+            search related.
+
+        initialization: Optional[np.ndarray]
+            The initial point positions to be used in the embedding space. Can be
+            a precomputed numpy array, ``pca``, ``spectral`` or ``random``. Please
+            note that when passing in a precomputed positions, it is highly
+            recommended that the point positions have small variance
+            (std(Y) < 0.0001), otherwise you may get poor embeddings.
 
         Returns
         -------
@@ -1234,11 +1297,19 @@ class TSNE(BaseEstimator):
 
         """
 
-        if self.affinities is None:
-            affinities = PerplexityBasedNN(
+        # Either `X` or `affinities` must be specified
+        if X is None and affinities is None and initialization is None:
+            raise ValueError(
+                "At least one of the parameters `X` or `affinities` must be specified!"
+            )
+
+        # If precomputed affinites are given, use those, otherwise proceed with
+        # standard perpelxity-based affinites
+        if affinities is None:
+            affinities = MultiscaleMixture(
                 X,
                 self.perplexity,
-                method=self.neighbors_method,
+                method=self.neighbors,
                 metric=self.metric,
                 metric_params=self.metric_params,
                 n_jobs=self.n_jobs,
@@ -1246,18 +1317,54 @@ class TSNE(BaseEstimator):
                 verbose=self.verbose,
             )
         else:
+            if not isinstance(affinities, Affinities):
+                raise ValueError(
+                    "`affinities` must be an instance of `openTSNE.affinity.Affinities`"
+                )
             log.info(
-                "Precomputed affinities provided. Ignoring perplexity-related "
+                "Precomputed affinities provided. Ignoring perplexity-related parameters."
+            )
+
+        # If a precomputed initialization was specified, use that, otherwise
+        # use the parameters specified in the constructor
+        if initialization is None:
+            initialization = self.initialization
+            log.info(
+                "Precomputed initialization provided. Ignoring initalization-related "
                 "parameters."
             )
-            affinities = self.affinities
+
+        # If only the affinites have been specified, and the initialization depends
+        # on `X`, switch to spectral initalization
+        if X is None and isinstance(initialization, str) and initialization == "pca":
+            log.warning(
+                "Attempting to use `pca` initalization, but no `X` matrix specified! "
+                "Using `spectral` initilization instead, which doesn't need access "
+                "to the data matrix"
+            )
+            initialization = "spectral"
+
+        # Same spiel for precomputed distance matrices
+        if self.metric == "precomputed" and isinstance(initialization, str) and initialization == "pca":
+            log.warning(
+                "Attempting to use `pca` initalization, but using precomputed "
+                "distance matrix! Using `spectral` initilization instead, which "
+                "doesn't need access to the data matrix."
+            )
+            initialization = "spectral"
+
+        # Determine the number of samples in the input data set
+        if X is not None:
+            n_samples = X.shape[0]
+        else:
+            n_samples = affinities.P.shape[0]
 
         # If initial positions are given in an array, use a copy of that
-        if isinstance(self.initialization, np.ndarray):
-            init_checks.num_samples(self.initialization.shape[0], X.shape[0])
-            init_checks.num_dimensions(self.initialization.shape[1], self.n_components)
+        if isinstance(initialization, np.ndarray):
+            init_checks.num_samples(initialization.shape[0], n_samples)
+            init_checks.num_dimensions(initialization.shape[1], self.n_components)
 
-            embedding = np.array(self.initialization)
+            embedding = np.array(initialization)
 
             stddev = np.std(embedding, axis=0)
             if any(stddev > 1e-2):
@@ -1266,21 +1373,21 @@ class TSNE(BaseEstimator):
                     "embeddings with high variance may have display poor convergence."
                 )
 
-        elif self.initialization == "pca":
+        elif initialization == "pca":
             embedding = initialization_scheme.pca(
                 X,
                 self.n_components,
                 random_state=self.random_state,
                 verbose=self.verbose,
             )
-        elif self.initialization == "random":
+        elif initialization == "random":
             embedding = initialization_scheme.random(
-                X,
+                n_samples,
                 self.n_components,
                 random_state=self.random_state,
                 verbose=self.verbose,
             )
-        elif self.initialization == "spectral":
+        elif initialization == "spectral":
             embedding = initialization_scheme.spectral(
                 affinities.P,
                 self.n_components,
@@ -1289,7 +1396,7 @@ class TSNE(BaseEstimator):
             )
         else:
             raise ValueError(
-                f"Unrecognized initialization scheme `{self.initialization}`."
+                f"Unrecognized initialization scheme `{initialization}`."
             )
 
         gradient_descent_params = {
@@ -1387,10 +1494,6 @@ def kl_divergence_fft(
     n_jobs=1,
     **_,
 ):
-    # If the interpolation grid has not yet been evaluated, do it now
-    if reference_embedding is not None and reference_embedding.interp_coeffs is None:
-        reference_embedding.prepare_interpolation_grid()
-
     gradient = np.zeros_like(embedding, dtype=np.float64, order="C")
 
     # Compute negative gradient.
@@ -1398,7 +1501,7 @@ def kl_divergence_fft(
         if reference_embedding is not None:
             sum_Q = _tsne.estimate_negative_gradient_fft_1d_with_grid(
                 embedding.ravel(),
-                reference_embedding.ravel(),
+                gradient.ravel(),
                 reference_embedding.interp_coeffs,
                 reference_embedding.box_x_lower_bounds,
                 fft_params["n_interpolation_points"],
@@ -1606,6 +1709,14 @@ class gradient_descent:
                 "`%s` instead" % type(reference_embedding)
             )
 
+        # If the interpolation grid has not yet been evaluated, do it now
+        if (
+            reference_embedding is not None and
+            reference_embedding.interp_coeffs is None and
+            objective_function is kl_divergence_fft
+        ):
+            reference_embedding.prepare_interpolation_grid()
+
         # If we're running transform and using the interpolation scheme, then we
         # should limit the range where new points can go to
         should_limit_range = False
@@ -1617,7 +1728,7 @@ class gradient_descent:
 
         update = np.zeros_like(embedding)
         if self.gains is None:
-            self.gains = np.ones_like(embedding)
+            self.gains = np.ones_like(embedding).view(np.ndarray)
 
         bh_params = {"theta": theta}
         fft_params = {
@@ -1723,16 +1834,12 @@ class gradient_descent:
             # Limit any new points within the circle defined by the interpolation grid
             if should_limit_range:
                 if embedding.shape[1] == 1:
-                    mask = (lower_limit < embedding) & (embedding < upper_limit)
+                    mask = (embedding < lower_limit) | (embedding > upper_limit)
                     np.clip(embedding, lower_limit, upper_limit, out=embedding)
                 elif embedding.shape[1] == 2:
-                    r = np.linalg.norm(embedding, axis=1)
-                    phi = np.arctan2(embedding[:, 0], embedding[:, 1])
-                    mask = (lower_limit < embedding) & (embedding < upper_limit)
-                    mask = np.any(mask, axis=1)
-                    np.clip(r, lower_limit, upper_limit, out=r)
-                    embedding[:, 0] = r * np.cos(phi)
-                    embedding[:, 1] = r * np.sin(phi)
+                    r_limit = max(abs(lower_limit), abs(upper_limit))
+                    embedding, mask = utils.clip_point_to_disc(embedding, r_limit, inplace=True)
+
                 # Zero out the momentum terms for the points that hit the boundary
                 self.gains[~mask] = 0
 
@@ -1763,4 +1870,3 @@ class gradient_descent:
         )
 
         return error, embedding
-
